@@ -112,18 +112,20 @@ class SupportResistanceEngine:
 
     def get_static_levels(self, token):
         """Calculates PDH/L, Weekly H/L, Monthly H/L"""
-        # Fetch Daily for PDH, Weekly for WH, etc.
+        # Fetch 60 days of Daily data to calculate Previous Day, Week, and Month
         d_data = self.kite.historical_data(token, (datetime.now()-timedelta(days=60)), datetime.now(), "day")
+        if not d_data: return None
         df_d = pd.DataFrame(d_data)
         
         # PDH/PDL
         pdh, pdl = df_d['high'].iloc[-2], df_d['low'].iloc[-2]
         
-        # Weekly/Monthly
         df_d['date'] = pd.to_datetime(df_d['date'])
         df_d.set_index('date', inplace=True)
-        df_w = df_d.resample('W').agg({'high':'max', 'low':'min'})
-        df_m = df_d.resample('M').agg({'high':'max', 'low':'min'})
+        
+        # FIX: 'W' becomes 'W-SUN' and 'M' becomes 'ME' (Month End) for compatibility
+        df_w = df_d.resample('W-SUN').agg({'high':'max', 'low':'min'})
+        df_m = df_d.resample('ME').agg({'high':'max', 'low':'min'})
         
         return {
             "PDH": pdh, "PDL": pdl,
@@ -153,20 +155,23 @@ class SupportResistanceEngine:
         l3 = last_c - (rng * 1.1 / 4)
         l4 = last_c - (rng * 1.1 / 2)
 
-        # Fibonacci (from most recent significant swing)
+        # Fibonacci (from current view range)
         max_p = df['high'].max()
         min_p = df['low'].min()
         diff = max_p - min_p
         fibs = {
-            "61.8%": max_p - (diff * 0.618),
+            "23.6%": max_p - (diff * 0.236),
+            "38.2%": max_p - (diff * 0.382),
             "50.0%": max_p - (diff * 0.5),
-            "38.2%": max_p - (diff * 0.382)
+            "61.8%": max_p - (diff * 0.618),
+            "78.6%": max_p - (diff * 0.786)
         }
 
         return {"PP": pp, "TC": tc, "BC": bc, "H4": h4, "H3": h3, "L3": l3, "L4": l4, "Fibs": fibs}
 
-    def get_volume_profile(self, df, bins=20):
+    def get_volume_profile(self, df, bins=30):
         """Simple Volume Profile calculation for POC"""
+        # Distribute volume across price bins
         price_range = np.linspace(df['low'].min(), df['high'].max(), bins)
         v_profile = df.groupby(pd.cut(df['close'], bins=price_range))['volume'].sum()
         poc_bin = v_profile.idxmax()
@@ -206,45 +211,46 @@ if st.sidebar.button("Execute Unified Analysis"):
             df = data_eng.fetch_ohlcv(symbols[sym], tf)
             
             if df is not None:
-                # Section 1 logic
+                # SECTION 1 Calculation
                 struct_eng = MarketStructureEngine()
                 df, s_trend = struct_eng.calculate_structure(df)
                 trend_eng = TrendDirectionEngine()
                 df = trend_eng.analyze(df)
                 
-                # SECTION 2: SUPPORT & RESISTANCE
+                # SECTION 2 Calculation
                 sr_eng = SupportResistanceEngine(data_eng.kite)
                 static = sr_eng.get_static_levels(symbols[sym])
                 advanced = sr_eng.calculate_advanced_levels(df)
                 poc = sr_eng.get_volume_profile(df)
                 
-                # UI Layout
+                # Metrics Display
                 row = df.iloc[-1]
-                st.subheader(f"Analysis for {sym} ({tf})")
+                st.subheader(f"Dashboard Analysis: {sym} ({tf})")
                 
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Trend", s_trend)
-                c2.metric("POC (Volume)", round(poc, 2))
-                c3.metric("CPR Width", round(abs(advanced['TC'] - advanced['BC']), 2))
-                c4.metric("ADX", round(row['adx'], 2))
+                c1.metric("Market Structure", s_trend)
+                c2.metric("Point of Control (POC)", round(poc, 2))
+                c3.metric("Trend Strength (ADX)", round(row['adx'], 2))
+                c4.metric("CPR Bias", "Neutral" if abs(advanced['TC']-advanced['BC']) < (row['close']*0.001) else "Wide")
 
-                # Charting
+                # Main Plot
                 fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'])])
                 
-                # Plot Static Levels
-                fig.add_hline(y=static['PDH'], line_dash="dot", line_color="green", annotation_text="PDH")
-                fig.add_hline(y=static['PDL'], line_dash="dot", line_color="red", annotation_text="PDL")
-                fig.add_hline(y=advanced['PP'], line_color="yellow", annotation_text="Pivot")
-                fig.add_hline(y=poc, line_color="cyan", annotation_text="POC")
+                # Visualizing Support/Resistance
+                fig.add_hline(y=static['PDH'], line_dash="dash", line_color="green", annotation_text="Prev Day High")
+                fig.add_hline(y=static['PDL'], line_dash="dash", line_color="red", annotation_text="Prev Day Low")
+                fig.add_hline(y=advanced['PP'], line_color="yellow", line_width=2, annotation_text="Pivot Point")
+                fig.add_hline(y=poc, line_color="cyan", line_dash="dot", annotation_text="Volume POC")
                 
                 fig.update_layout(height=700, template="plotly_dark")
                 st.plotly_chart(fig, use_container_width=True)
 
-                # Detailed Levels Tab
-                t1, t2, t3 = st.tabs(["Static Levels", "Pivots & CPR", "Fibonacci"])
+                # Data Tabs
+                t1, t2, t3 = st.tabs(["Static Levels (Highs/Lows)", "Pivot & CPR Details", "Fibonacci Retracement"])
                 with t1:
-                    st.write(static)
+                    st.json(static)
                 with t2:
-                    st.write({k: v for k, v in advanced.items() if k != 'Fibs'})
+                    st.write("Advanced Levels (Camarilla & CPR)")
+                    st.table(pd.DataFrame([advanced]).drop('Fibs', axis=1))
                 with t3:
-                    st.write(advanced['Fibs'])
+                    st.table(pd.DataFrame.from_dict(advanced['Fibs'], orient='index', columns=['Price Level']))

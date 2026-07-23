@@ -11,7 +11,6 @@ from datetime import datetime, timedelta
 # ==========================================
 class PriceDataEngine:
     def __init__(self, api_key, access_token):
-        # STRIP removes accidental spaces from copy-pasting
         self.api_key = api_key.strip()
         self.access_token = access_token.strip()
         self.kite = KiteConnect(api_key=self.api_key)
@@ -24,7 +23,6 @@ class PriceDataEngine:
         }
 
     def test_connection(self):
-        """Verify if the token is valid by fetching profile"""
         try:
             profile = self.kite.profile()
             return True, f"Connected! Welcome, {profile.get('user_name')}"
@@ -100,24 +98,91 @@ class TrendDirectionEngine:
         df['ema200'] = ta.trend.EMAIndicator(df['close'], 200).ema_indicator()
         df['adx'] = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], 14).adx()
         df['vwap'] = ta.volume.VolumeWeightedAveragePrice(df['high'], df['low'], df['close'], df['volume']).volume_weighted_average_price()
-        # Custom SuperTrend logic for 'ta' library
         atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], 10).average_true_range()
         df['st_upper'] = ((df['high']+df['low'])/2) + (3 * atr)
         df['st_bull'] = df['close'] > df['st_upper'].shift(1)
         return df
 
 # ==========================================
+# 4. SUPPORT & RESISTANCE - Roadmap Section 2
+# ==========================================
+class SupportResistanceEngine:
+    def __init__(self, kite_instance):
+        self.kite = kite_instance
+
+    def get_static_levels(self, token):
+        """Calculates PDH/L, Weekly H/L, Monthly H/L"""
+        # Fetch Daily for PDH, Weekly for WH, etc.
+        d_data = self.kite.historical_data(token, (datetime.now()-timedelta(days=60)), datetime.now(), "day")
+        df_d = pd.DataFrame(d_data)
+        
+        # PDH/PDL
+        pdh, pdl = df_d['high'].iloc[-2], df_d['low'].iloc[-2]
+        
+        # Weekly/Monthly
+        df_d['date'] = pd.to_datetime(df_d['date'])
+        df_d.set_index('date', inplace=True)
+        df_w = df_d.resample('W').agg({'high':'max', 'low':'min'})
+        df_m = df_d.resample('M').agg({'high':'max', 'low':'min'})
+        
+        return {
+            "PDH": pdh, "PDL": pdl,
+            "WH": df_w['high'].iloc[-2], "WL": df_w['low'].iloc[-2],
+            "MH": df_m['high'].iloc[-2], "ML": df_m['low'].iloc[-2]
+        }
+
+    def calculate_advanced_levels(self, df):
+        """Pivot Points, Camarilla, CPR, Fibonacci"""
+        last_h = df['high'].iloc[-1]
+        last_l = df['low'].iloc[-1]
+        last_c = df['close'].iloc[-1]
+        rng = last_h - last_l
+
+        # Pivot Points (Standard)
+        pp = (last_h + last_l + last_c) / 3
+        r1 = (2 * pp) - last_l
+        s1 = (2 * pp) - last_h
+
+        # CPR
+        bc = (last_h + last_l) / 2
+        tc = (pp - bc) + pp
+        
+        # Camarilla
+        h4 = last_c + (rng * 1.1 / 2)
+        h3 = last_c + (rng * 1.1 / 4)
+        l3 = last_c - (rng * 1.1 / 4)
+        l4 = last_c - (rng * 1.1 / 2)
+
+        # Fibonacci (from most recent significant swing)
+        max_p = df['high'].max()
+        min_p = df['low'].min()
+        diff = max_p - min_p
+        fibs = {
+            "61.8%": max_p - (diff * 0.618),
+            "50.0%": max_p - (diff * 0.5),
+            "38.2%": max_p - (diff * 0.382)
+        }
+
+        return {"PP": pp, "TC": tc, "BC": bc, "H4": h4, "H3": h3, "L3": l3, "L4": l4, "Fibs": fibs}
+
+    def get_volume_profile(self, df, bins=20):
+        """Simple Volume Profile calculation for POC"""
+        price_range = np.linspace(df['low'].min(), df['high'].max(), bins)
+        v_profile = df.groupby(pd.cut(df['close'], bins=price_range))['volume'].sum()
+        poc_bin = v_profile.idxmax()
+        poc = (poc_bin.left + poc_bin.right) / 2
+        return poc
+
+# ==========================================
 # MAIN STREAMLIT UI
 # ==========================================
 st.set_page_config(layout="wide", page_title="Unified Roadmap Dashboard")
-st.title("🛡️ Roadmap Section 1: Data, Structure & Trend")
+st.title("🛡️ Roadmap Section 1 & 2: Structure, Trend & S/R")
 
-# Sidebar
 st.sidebar.header("🔑 Kite API Provision")
 in_api_key = st.sidebar.text_input("Kite API Key", value="", type="password")
 in_access_token = st.sidebar.text_input("Access Token", value="", type="password")
 
-# Mapping Instrument Tokens (NSE)
 symbols = {
     "NIFTY 50": 256265, "BANK NIFTY": 260105, "FIN NIFTY": 257801, 
     "SENSEX": 265, "MIDCAP NIFTY": 288009, 
@@ -131,45 +196,55 @@ if st.sidebar.button("Execute Unified Analysis"):
     if not in_api_key or not in_access_token:
         st.warning("Please enter credentials.")
     else:
-        # Initialize
         data_eng = PriceDataEngine(in_api_key, in_access_token)
-        
-        # Test Connection first
         success, msg = data_eng.test_connection()
+        
         if not success:
             st.error(msg)
-            st.info("💡 Ensure you generated a NEW access token today. Tokens from yesterday will not work.")
         else:
             st.sidebar.success(msg)
-            with st.spinner("Analyzing Market Structure..."):
-                df = data_eng.fetch_ohlcv(symbols[sym], tf)
-                if df is not None:
-                    # Logic Steps
-                    struct_eng = MarketStructureEngine()
-                    df, s_trend = struct_eng.calculate_structure(df)
-                    
-                    trend_eng = TrendDirectionEngine()
-                    df = trend_eng.analyze(df)
-                    
-                    # Confidence Score
-                    row = df.iloc[-1]
-                    score = 0
-                    if row['close'] > row['ema200']: score += 2
-                    if row['st_bull']: score += 1
-                    if row['adx'] > 25: score += 1
-                    
-                    state = "STRONG BULLISH" if score >= 3 else "BULLISH" if score >= 1 else "BEARISH/SIDEWAYS"
-                    
-                    # Display Results
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Market State", state)
-                    c2.metric("Confidence Score", score)
-                    c3.metric("ADX (Strength)", round(row['adx'], 2))
-                    c4.metric("Structure", s_trend)
+            df = data_eng.fetch_ohlcv(symbols[sym], tf)
+            
+            if df is not None:
+                # Section 1 logic
+                struct_eng = MarketStructureEngine()
+                df, s_trend = struct_eng.calculate_structure(df)
+                trend_eng = TrendDirectionEngine()
+                df = trend_eng.analyze(df)
+                
+                # SECTION 2: SUPPORT & RESISTANCE
+                sr_eng = SupportResistanceEngine(data_eng.kite)
+                static = sr_eng.get_static_levels(symbols[sym])
+                advanced = sr_eng.calculate_advanced_levels(df)
+                poc = sr_eng.get_volume_profile(df)
+                
+                # UI Layout
+                row = df.iloc[-1]
+                st.subheader(f"Analysis for {sym} ({tf})")
+                
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Trend", s_trend)
+                c2.metric("POC (Volume)", round(poc, 2))
+                c3.metric("CPR Width", round(abs(advanced['TC'] - advanced['BC']), 2))
+                c4.metric("ADX", round(row['adx'], 2))
 
-                    fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'])])
-                    fig.update_layout(height=600, template="plotly_dark", title=f"{sym} Analysis")
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    st.subheader("Market Structure Breaks (BOS/CHOCH)")
-                    st.write(df[df['break'] != ""][['close', 'label', 'break']].tail(10))
+                # Charting
+                fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'])])
+                
+                # Plot Static Levels
+                fig.add_hline(y=static['PDH'], line_dash="dot", line_color="green", annotation_text="PDH")
+                fig.add_hline(y=static['PDL'], line_dash="dot", line_color="red", annotation_text="PDL")
+                fig.add_hline(y=advanced['PP'], line_color="yellow", annotation_text="Pivot")
+                fig.add_hline(y=poc, line_color="cyan", annotation_text="POC")
+                
+                fig.update_layout(height=700, template="plotly_dark")
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Detailed Levels Tab
+                t1, t2, t3 = st.tabs(["Static Levels", "Pivots & CPR", "Fibonacci"])
+                with t1:
+                    st.write(static)
+                with t2:
+                    st.write({k: v for k, v in advanced.items() if k != 'Fibs'})
+                with t3:
+                    st.write(advanced['Fibs'])

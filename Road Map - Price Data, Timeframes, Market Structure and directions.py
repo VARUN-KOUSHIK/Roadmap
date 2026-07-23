@@ -5,6 +5,7 @@ import ta
 import plotly.graph_objects as go
 from kiteconnect import KiteConnect
 from datetime import datetime, timedelta
+from scipy.signal import find_peaks
 
 # ==========================================
 # 1. PRICE DATA (OHLCV) - Roadmap Section 1
@@ -91,39 +92,49 @@ class MarketStructureEngine:
         return df, curr_struct_trend
 
 # ==========================================
-# 3. TREND DIRECTION - Roadmap Section 1
+# 3. TREND DIRECTION (Dynamic Levels) - Section 1 & 2
 # ==========================================
 class TrendDirectionEngine:
     def analyze(self, df):
+        # Dynamic Levels: EMA & SMA
         df['ema200'] = ta.trend.EMAIndicator(df['close'], 200).ema_indicator()
-        df['adx'] = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], 14).adx()
+        df['ema50'] = ta.trend.EMAIndicator(df['close'], 50).ema_indicator()
+        df['sma50'] = ta.trend.SMAIndicator(df['close'], 50).sma_indicator()
+        df['sma200'] = ta.trend.SMAIndicator(df['close'], 200).sma_indicator()
+        
+        # Dynamic Levels: VWAP
         df['vwap'] = ta.volume.VolumeWeightedAveragePrice(df['high'], df['low'], df['close'], df['volume']).volume_weighted_average_price()
-        atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], 10).average_true_range()
-        df['st_upper'] = ((df['high']+df['low'])/2) + (3 * atr)
+        
+        # Dynamic Levels: Super Trend
+        atr_period = 10
+        atr_multiplier = 3
+        atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], atr_period).average_true_range()
+        
+        hl2 = (df['high'] + df['low']) / 2
+        df['st_upper'] = hl2 + (atr_multiplier * atr)
+        df['st_lower'] = hl2 - (atr_multiplier * atr)
+        
+        # Roadmap: Trend Strength Indicator (ADX)
+        df['adx'] = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], 14).adx()
         df['st_bull'] = df['close'] > df['st_upper'].shift(1)
+        
         return df
 
 # ==========================================
-# 4. SUPPORT & RESISTANCE - Roadmap Section 2
+# 4. SUPPORT & RESISTANCE (Static & Advanced) - Section 2
 # ==========================================
 class SupportResistanceEngine:
     def __init__(self, kite_instance):
         self.kite = kite_instance
 
     def get_static_levels(self, token):
-        """Calculates PDH/L, Weekly H/L, Monthly H/L"""
-        # Fetch 60 days of Daily data to calculate Previous Day, Week, and Month
         d_data = self.kite.historical_data(token, (datetime.now()-timedelta(days=60)), datetime.now(), "day")
         if not d_data: return None
         df_d = pd.DataFrame(d_data)
-        
-        # PDH/PDL
         pdh, pdl = df_d['high'].iloc[-2], df_d['low'].iloc[-2]
-        
         df_d['date'] = pd.to_datetime(df_d['date'])
         df_d.set_index('date', inplace=True)
         
-        # FIX: 'W' becomes 'W-SUN' and 'M' becomes 'ME' (Month End) for compatibility
         df_w = df_d.resample('W-SUN').agg({'high':'max', 'low':'min'})
         df_m = df_d.resample('ME').agg({'high':'max', 'low':'min'})
         
@@ -134,18 +145,9 @@ class SupportResistanceEngine:
         }
 
     def calculate_advanced_levels(self, df):
-        """Pivot Points, Camarilla, CPR, Fibonacci"""
-        last_h = df['high'].iloc[-1]
-        last_l = df['low'].iloc[-1]
-        last_c = df['close'].iloc[-1]
+        last_h, last_l, last_c = df['high'].iloc[-1], df['low'].iloc[-1], df['close'].iloc[-1]
         rng = last_h - last_l
-
-        # Pivot Points (Standard)
         pp = (last_h + last_l + last_c) / 3
-        r1 = (2 * pp) - last_l
-        s1 = (2 * pp) - last_h
-
-        # CPR
         bc = (last_h + last_l) / 2
         tc = (pp - bc) + pp
         
@@ -155,47 +157,48 @@ class SupportResistanceEngine:
         l3 = last_c - (rng * 1.1 / 4)
         l4 = last_c - (rng * 1.1 / 2)
 
-        # Fibonacci (from current view range)
-        max_p = df['high'].max()
-        min_p = df['low'].min()
+        # Fibonacci
+        max_p, min_p = df['high'].max(), df['low'].min()
         diff = max_p - min_p
-        fibs = {
-            "23.6%": max_p - (diff * 0.236),
-            "38.2%": max_p - (diff * 0.382),
-            "50.0%": max_p - (diff * 0.5),
-            "61.8%": max_p - (diff * 0.618),
-            "78.6%": max_p - (diff * 0.786)
-        }
+        fibs = {"23.6%": max_p - (diff * 0.236), "38.2%": max_p - (diff * 0.382), "50.0%": max_p - (diff * 0.5), "61.8%": max_p - (diff * 0.618)}
 
         return {"PP": pp, "TC": tc, "BC": bc, "H4": h4, "H3": h3, "L3": l3, "L4": l4, "Fibs": fibs}
 
-    def get_volume_profile(self, df, bins=30):
-        """Simple Volume Profile calculation for POC"""
-        # Distribute volume across price bins
-        price_range = np.linspace(df['low'].min(), df['high'].max(), bins)
-        v_profile = df.groupby(pd.cut(df['close'], bins=price_range))['volume'].sum()
-        poc_bin = v_profile.idxmax()
-        poc = (poc_bin.left + poc_bin.right) / 2
-        return poc
+    def get_volume_profile_advanced(self, df, bins=50):
+        """Calculates POC, High Volume Nodes (HVN), and Low Volume Nodes (LVN)"""
+        # Create Histogram
+        volume_counts, price_bins = np.histogram(df['close'], bins=bins, weights=df['volume'])
+        bin_centers = (price_bins[:-1] + price_bins[1:]) / 2
+        
+        # Point of Control (POC)
+        poc_idx = np.argmax(volume_counts)
+        poc = bin_centers[poc_idx]
+        
+        # High Volume Nodes (HVN) - Peaks in volume distribution
+        hvn_indices, _ = find_peaks(volume_counts, height=np.mean(volume_counts))
+        hvns = bin_centers[hvn_indices]
+        
+        # Low Volume Nodes (LVN) - Valleys in volume distribution
+        # We invert volume to find valleys as peaks
+        inverted_volume = np.max(volume_counts) - volume_counts
+        lvn_indices, _ = find_peaks(inverted_volume, height=np.mean(inverted_volume))
+        lvns = bin_centers[lvn_indices]
+        
+        return {"POC": poc, "HVNs": hvns.tolist(), "LVNs": lvns.tolist()}
 
 # ==========================================
 # MAIN STREAMLIT UI
 # ==========================================
 st.set_page_config(layout="wide", page_title="Unified Roadmap Dashboard")
-st.title("🛡️ Roadmap Section 1 & 2: Structure, Trend & S/R")
+st.title("🛡️ Roadmap Section 1 & 2: Complete Logic Engine")
 
 st.sidebar.header("🔑 Kite API Provision")
-in_api_key = st.sidebar.text_input("Kite API Key", value="", type="password")
-in_access_token = st.sidebar.text_input("Access Token", value="", type="password")
+in_api_key = st.sidebar.text_input("Kite API Key", type="password")
+in_access_token = st.sidebar.text_input("Access Token", type="password")
 
-symbols = {
-    "NIFTY 50": 256265, "BANK NIFTY": 260105, "FIN NIFTY": 257801, 
-    "SENSEX": 265, "MIDCAP NIFTY": 288009, 
-    "RELIANCE": 738561, "HDFC BANK": 341249, "TCS": 295321, "INFY": 408065
-}
-
+symbols = {"NIFTY 50": 256265, "BANK NIFTY": 260105, "RELIANCE": 738561, "HDFC BANK": 341249, "TCS": 295321}
 sym = st.sidebar.selectbox("Symbol", list(symbols.keys()))
-tf = st.sidebar.selectbox("Timeframe", ["1 Minute", "3 Minute", "5 Minute", "15 Minute", "30 Minute", "1 Hour", "Daily"])
+tf = st.sidebar.selectbox("Timeframe", ["1 Minute", "5 Minute", "15 Minute", "1 Hour", "Daily"])
 
 if st.sidebar.button("Execute Unified Analysis"):
     if not in_api_key or not in_access_token:
@@ -204,53 +207,55 @@ if st.sidebar.button("Execute Unified Analysis"):
         data_eng = PriceDataEngine(in_api_key, in_access_token)
         success, msg = data_eng.test_connection()
         
-        if not success:
-            st.error(msg)
-        else:
-            st.sidebar.success(msg)
+        if success:
             df = data_eng.fetch_ohlcv(symbols[sym], tf)
-            
             if df is not None:
-                # SECTION 1 Calculation
+                # 1. Structure
                 struct_eng = MarketStructureEngine()
                 df, s_trend = struct_eng.calculate_structure(df)
+                
+                # 2. Trend & Dynamic Levels (EMA, SMA, VWAP, SuperTrend)
                 trend_eng = TrendDirectionEngine()
                 df = trend_eng.analyze(df)
                 
-                # SECTION 2 Calculation
+                # 3. Support & Resistance (Static, Pivots, Advanced Volume Profile)
                 sr_eng = SupportResistanceEngine(data_eng.kite)
                 static = sr_eng.get_static_levels(symbols[sym])
                 advanced = sr_eng.calculate_advanced_levels(df)
-                poc = sr_eng.get_volume_profile(df)
+                vol_profile = sr_eng.get_volume_profile_advanced(df)
                 
-                # Metrics Display
+                # UI Metrics
                 row = df.iloc[-1]
-                st.subheader(f"Dashboard Analysis: {sym} ({tf})")
-                
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Market Structure", s_trend)
-                c2.metric("Point of Control (POC)", round(poc, 2))
-                c3.metric("Trend Strength (ADX)", round(row['adx'], 2))
-                c4.metric("CPR Bias", "Neutral" if abs(advanced['TC']-advanced['BC']) < (row['close']*0.001) else "Wide")
+                st.subheader(f"Dashboard: {sym} | {s_trend}")
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("POC", round(vol_profile['POC'], 2))
+                m2.metric("VWAP", round(row['vwap'], 2))
+                m3.metric("Super Trend", "Bullish" if row['st_bull'] else "Bearish")
+                m4.metric("EMA 200", round(row['ema200'], 2))
 
-                # Main Plot
+                # Charting
                 fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'])])
                 
-                # Visualizing Support/Resistance
-                fig.add_hline(y=static['PDH'], line_dash="dash", line_color="green", annotation_text="Prev Day High")
-                fig.add_hline(y=static['PDL'], line_dash="dash", line_color="red", annotation_text="Prev Day Low")
-                fig.add_hline(y=advanced['PP'], line_color="yellow", line_width=2, annotation_text="Pivot Point")
-                fig.add_hline(y=poc, line_color="cyan", line_dash="dot", annotation_text="Volume POC")
+                # Plot Dynamic Levels
+                fig.add_trace(go.Scatter(x=df.index, y=df['ema200'], name="EMA 200", line=dict(color='yellow', width=1.5)))
+                fig.add_trace(go.Scatter(x=df.index, y=df['vwap'], name="VWAP", line=dict(color='cyan', width=1)))
                 
+                # Plot POC & HVNs
+                fig.add_hline(y=vol_profile['POC'], line_color="orange", line_width=2, annotation_text="POC")
+                for hvn in vol_profile['HVNs'][:3]: # Plot top 3 HVNs
+                    fig.add_hline(y=hvn, line_dash="dot", line_color="rgba(0, 255, 0, 0.5)", annotation_text="HVN")
+
                 fig.update_layout(height=700, template="plotly_dark")
                 st.plotly_chart(fig, use_container_width=True)
 
-                # Data Tabs
-                t1, t2, t3 = st.tabs(["Static Levels (Highs/Lows)", "Pivot & CPR Details", "Fibonacci Retracement"])
+                # Data breakdown
+                t1, t2 = st.tabs(["Volume Profile Nodes", "Advanced Pivots"])
                 with t1:
-                    st.json(static)
+                    st.write("**High Volume Nodes (Strong S/R):**")
+                    st.write(vol_profile['HVNs'])
+                    st.write("**Low Volume Nodes (Price Gaps):**")
+                    st.write(vol_profile['LVNs'])
                 with t2:
-                    st.write("Advanced Levels (Camarilla & CPR)")
-                    st.table(pd.DataFrame([advanced]).drop('Fibs', axis=1))
-                with t3:
-                    st.table(pd.DataFrame.from_dict(advanced['Fibs'], orient='index', columns=['Price Level']))
+                    st.json(advanced)
+        else:
+            st.error(msg)

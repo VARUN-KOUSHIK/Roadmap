@@ -33,15 +33,12 @@ class PriceDataEngine:
     def test_connection(self):
         try:
             profile = self.kite.profile()
-            return True, f"Connected! Welcome, {profile.get('user_name')}"
+            return True, f"Connected: {profile.get('user_name')}"
         except Exception as e:
             return False, f"Connection Failed: {str(e)}"
 
     def fetch_ohlcv(self, symbol_token, timeframe):
-        limits = {
-            "1 Minute": 30, "3 Minute": 90, "5 Minute": 90, "15 Minute": 90,
-            "30 Minute": 180, "1 Hour": 180, "4 Hour": 180, "Daily": 1000, "Weekly": 1000
-        }
+        limits = {"1 Minute": 30, "3 Minute": 60, "5 Minute": 60, "15 Minute": 90, "1 Hour": 180, "Daily": 365}
         days_back = limits.get(timeframe, 30)
         try:
             records = self.kite.historical_data(
@@ -54,14 +51,9 @@ class PriceDataEngine:
             df = pd.DataFrame(records)
             df['date'] = pd.to_datetime(df['date'])
             df.set_index('date', inplace=True)
-            
-            if timeframe == "4 Hour":
-                df = df.resample('4H').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
-            elif timeframe == "Weekly":
-                df = df.resample('W-MON').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
             return df
         except Exception as e:
-            st.error(f"Kite Fetch Error for {timeframe}: {e}")
+            st.error(f"Kite Error: {e}")
             return None
 
 # ==========================================
@@ -72,206 +64,146 @@ class MarketStructureEngine:
         df = df.copy()
         df['swing_high'] = df['high'][(df['high'] == df['high'].rolling(window=window, center=True).max())]
         df['swing_low'] = df['low'][(df['low'] == df['low'].rolling(window=window, center=True).min())]
-        df['label'] = "" 
-        df['break'] = "" 
+        df['label'], df['break'] = "", "" 
         last_sh, last_sl = 0, 0
-        curr_struct_trend = "Sideways"
-        
+        trend = "Sideways"
         for i in range(window, len(df)):
             if not np.isnan(df['swing_high'].iloc[i]):
-                this_h = df['swing_high'].iloc[i]
-                if this_h > last_sh:
-                    df.at[df.index[i], 'label'] = "HH"
-                    if curr_struct_trend == "Bearish": df.at[df.index[i], 'break'] = "CHOCH"
-                    curr_struct_trend = "Bullish"
-                else: df.at[df.index[i], 'label'] = "LH"
-                last_sh = this_h
+                h = df['swing_high'].iloc[i]
+                df.at[df.index[i], 'label'] = "HH" if h > last_sh else "LH"
+                if trend == "Bearish" and h > last_sh: df.at[df.index[i], 'break'] = "CHOCH"
+                last_sh, trend = h, "Bullish"
             if not np.isnan(df['swing_low'].iloc[i]):
-                this_l = df['swing_low'].iloc[i]
-                if this_l < last_sl or last_sl == 0:
-                    df.at[df.index[i], 'label'] = "LL"
-                    if curr_struct_trend == "Bullish": df.at[df.index[i], 'break'] = "CHOCH"
-                    curr_struct_trend = "Bearish"
-                else: df.at[df.index[i], 'label'] = "HL"
-                last_sl = this_l
-            if curr_struct_trend == "Bullish" and df['close'].iloc[i] > last_sh and last_sh != 0:
-                if df['break'].iloc[i] == "": df.at[df.index[i], 'break'] = "BOS"
-            if curr_struct_trend == "Bearish" and df['close'].iloc[i] < last_sl and last_sl != 0:
-                if df['break'].iloc[i] == "": df.at[df.index[i], 'break'] = "BOS"
-        return df, curr_struct_trend
+                l = df['swing_low'].iloc[i]
+                df.at[df.index[i], 'label'] = "LL" if (l < last_sl or last_sl == 0) else "HL"
+                if trend == "Bullish" and l < last_sl: df.at[df.index[i], 'break'] = "CHOCH"
+                last_sl, trend = l, "Bearish"
+            if trend == "Bullish" and df['close'].iloc[i] > last_sh and last_sh != 0: df.at[df.index[i], 'break'] = "BOS"
+            if trend == "Bearish" and df['close'].iloc[i] < last_sl and last_sl != 0: df.at[df.index[i], 'break'] = "BOS"
+        return df, trend
 
 # ==========================================
-# 3. TREND DIRECTION (Dynamic Levels) - Roadmap Section 1 & 2
-# ==========================================
-class TrendDirectionEngine:
-    def analyze(self, df):
-        df['ema50'] = ta.trend.EMAIndicator(df['close'], 50).ema_indicator()
-        df['ema200'] = ta.trend.EMAIndicator(df['close'], 200).ema_indicator()
-        df['sma200'] = ta.trend.SMAIndicator(df['close'], 200).sma_indicator()
-        df['vwap'] = ta.volume.VolumeWeightedAveragePrice(df['high'], df['low'], df['close'], df['volume']).volume_weighted_average_price()
-        atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], 10).average_true_range()
-        hl2 = (df['high'] + df['low']) / 2
-        df['st_upper'] = hl2 + (3 * atr)
-        df['st_bull'] = df['close'] > df['st_upper'].shift(1)
-        df['adx'] = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], 14).adx()
-        return df
-
-# ==========================================
-# 4. SUPPORT & RESISTANCE - Roadmap Section 2
+# 3. SUPPORT & RESISTANCE - Roadmap Section 2
 # ==========================================
 class SupportResistanceEngine:
-    def __init__(self, kite_instance):
-        self.kite = kite_instance
-
-    def get_static_levels(self, token):
-        d_data = self.kite.historical_data(token, (datetime.now()-timedelta(days=60)), datetime.now(), "day")
-        if not d_data: return None
-        df_d = pd.DataFrame(d_data)
-        pdh, pdl = df_d['high'].iloc[-2], df_d['low'].iloc[-2]
-        df_d['date'] = pd.to_datetime(df_d['date'])
-        df_d.set_index('date', inplace=True)
-        df_w = df_d.resample('W-SUN').agg({'high':'max', 'low':'min'})
-        df_m = df_d.resample('ME').agg({'high':'max', 'low':'min'})
-        return {
-            "PDH": pdh, "PDL": pdl, "WH": df_w['high'].iloc[-2], "WL": df_w['low'].iloc[-2], "MH": df_m['high'].iloc[-2], "ML": df_m['low'].iloc[-2]
-        }
-
-    def calculate_advanced_levels(self, df):
+    def calculate_levels(self, df):
         lh, ll, lc = df['high'].iloc[-1], df['low'].iloc[-1], df['close'].iloc[-1]
-        rng = lh - ll
         pp = (lh + ll + lc) / 3
-        bc, tc = (lh + ll) / 2, (pp - bc if 'bc' in locals() else (lh+ll)/2) + pp
+        bc, tc = (lh + ll) / 2, (pp - (lh + ll) / 2) + pp
         fibs = {"61.8%": lh-((lh-ll)*0.618), "50%": lh-((lh-ll)*0.5), "38.2%": lh-((lh-ll)*0.382)}
         return {"Pivot": pp, "TC": tc, "BC": bc, "Fibs": fibs}
 
-    def get_volume_profile(self, df, bins=50):
-        vol_counts, p_bins = np.histogram(df['close'], bins=bins, weights=df['volume'])
-        b_centers = (p_bins[:-1] + p_bins[1:]) / 2
-        poc = b_centers[np.argmax(vol_counts)]
-        hvns, lvns = [], []
-        if HAS_SCIPY:
-            h_idx, _ = find_peaks(vol_counts, height=np.mean(vol_counts))
-            hvns = b_centers[h_idx].tolist()
-            inv_v = np.max(vol_counts) - vol_counts
-            l_idx, _ = find_peaks(inv_v, height=np.mean(inv_v))
-            lvns = b_centers[l_idx].tolist()
-        return {"POC": poc, "HVNs": hvns, "LVNs": lvns}
-
 # ==========================================
-# 5. VOLUME ANALYSIS - Roadmap Section 3
+# 4. VOLUME & MOMENTUM - Roadmap Section 3 & 4
 # ==========================================
-class VolumeAnalysisEngine:
-    def calculate_volume_metrics(self, df):
-        df = df.copy()
-        # Average & Relative Volume
-        df['avg_vol'] = df['volume'].rolling(window=20).mean()
-        df['rel_vol'] = df['volume'] / df['avg_vol']
-        df['vol_spike'] = df['volume'] > (df['avg_vol'] * 2)
+class AnalysisEngine:
+    def process(self, df):
+        # Trend & Momentum (Section 4)
+        df['ema200'] = ta.trend.EMAIndicator(df['close'], 200).ema_indicator()
+        df['rsi'] = ta.momentum.RSIIndicator(df['close']).rsi()
+        df['adx'] = ta.trend.ADXIndicator(df['high'], df['low'], df['close']).adx()
+        df['vwap'] = ta.volume.VolumeWeightedAveragePrice(df['high'], df['low'], df['close'], df['volume']).volume_weighted_average_price()
         
-        # Volume Delta (Proxy: Selling Vol vs Buying Vol based on candle color)
-        df['vol_delta'] = np.where(df['close'] > df['open'], df['volume'], -df['volume'])
-        df['cvd'] = df['vol_delta'].cumsum()
-        
-        # Standard Indicators
+        # Volume (Section 3)
+        df['avg_vol'] = df['volume'].rolling(20).mean()
         df['obv'] = ta.volume.OnBalanceVolumeIndicator(df['close'], df['volume']).on_balance_volume()
         df['mfi'] = ta.volume.MFIIndicator(df['high'], df['low'], df['close'], df['volume']).money_flow_index()
-        df['cmf'] = ta.volume.ChaikinMoneyFlowIndicator(df['high'], df['low'], df['close'], df['volume']).chaikin_money_flow()
-        df['acc_dist'] = ta.volume.AccDistIndexIndicator(df['high'], df['low'], df['close'], df['volume']).acc_dist_index()
-        
         return df
 
 # ==========================================
-# MAIN STREAMLIT UI & LIVE REFRESH
+# 5. SIGNAL SCORING (Result Oriented) - Section 21
 # ==========================================
-st.set_page_config(layout="wide", page_title="Institutional Roadmap Dashboard")
-st.title("🏛️ Roadmap: Section 1, 2, & 3 Analysis")
+def calculate_signal(row, trend):
+    score = 0
+    reasons = []
+    
+    if row['close'] > row['ema200']: score += 25; reasons.append("Above EMA 200")
+    if 40 < row['rsi'] < 65: score += 15; reasons.append("RSI Neutral-Bullish")
+    if trend == "Bullish": score += 30; reasons.append("Market Structure Bullish")
+    if row['adx'] > 25: score += 20; reasons.append("Strong Trend Strength")
+    
+    if score >= 70: return "STRONG BUY", "green", reasons
+    if score >= 40: return "BUY / HOLD", "orange", reasons
+    return "BEARISH / AVOID", "red", reasons
 
-# Sidebar
-st.sidebar.header("🔑 API & Refresh")
-in_api_key = st.sidebar.text_input("Kite API Key", type="password")
-in_access_token = st.sidebar.text_input("Access Token", type="password")
-live_refresh = st.sidebar.checkbox("Enable Live Refresh (60s)")
+# ==========================================
+# MAIN DASHBOARD
+# ==========================================
+st.set_page_config(layout="wide", page_title="Result Dashboard")
+st.sidebar.header("🔑 Kite API & Live")
+api_key = st.sidebar.text_input("API Key", type="password")
+token = st.sidebar.text_input("Access Token", type="password")
+refresh_rate = st.sidebar.slider("Refresh Interval (Seconds)", 5, 60, 10)
+live_on = st.sidebar.toggle("Live Refresh Mode")
 
 symbols = {
     "NIFTY 50": 256265, "BANK NIFTY": 260105, "FIN NIFTY": 257801, 
-    "SENSEX": 265, "MIDCAP NIFTY": 288009, "RELIANCE": 738561, "HDFC BANK": 341249, "TCS": 295321
+    "RELIANCE": 738561, "HDFC BANK": 341249, "TCS": 295321
 }
-sym = st.sidebar.selectbox("Symbol", list(symbols.keys()))
-tf = st.sidebar.selectbox("Timeframe", ["1 Minute", "5 Minute", "15 Minute", "1 Hour", "Daily"])
+sym_name = st.sidebar.selectbox("Symbol", list(symbols.keys()))
+tf = st.sidebar.selectbox("Timeframe", ["1 Minute", "5 Minute", "15 Minute", "1 Hour"])
 
-# Main execution loop for live refresh
-def run_analysis():
-    if not in_api_key or not in_access_token:
-        st.warning("Please enter credentials.")
+def main():
+    if not api_key or not token:
+        st.info("Please enter API Key and Access Token in the sidebar to start live data.")
         return
 
-    data_eng = PriceDataEngine(in_api_key, in_access_token)
-    success, msg = data_eng.test_connection()
-    if not success:
-        st.error(msg)
-        return
-
-    df = data_eng.fetch_ohlcv(symbols[sym], tf)
+    engine = PriceDataEngine(api_key, token)
+    df = engine.fetch_ohlcv(symbols[sym_name], tf)
+    
     if df is not None:
-        # Step 1 & 2: Structure & Trend
-        df, s_trend = MarketStructureEngine().calculate_structure(df)
-        df = TrendDirectionEngine().analyze(df)
+        # Process Modules in Roadmap Order
+        df, trend = MarketStructureEngine().calculate_structure(df)
+        df = AnalysisEngine().process(df)
+        levels = SupportResistanceEngine().calculate_levels(df)
         
-        # Step 3: Volume Analysis (NEW)
-        df = VolumeAnalysisEngine().calculate_volume_metrics(df)
-        
-        # Step 4: S/R Advanced
-        sr_eng = SupportResistanceEngine(data_eng.kite)
-        static = sr_eng.get_static_levels(symbols[sym])
-        advanced = sr_eng.calculate_advanced_levels(df)
-        v_profile = sr_eng.get_volume_profile(df)
-        
-        # Layout Results
+        # Latest Data for Dashboard
         row = df.iloc[-1]
-        st.subheader(f"Strategy View: {sym} | Last Update: {datetime.now().strftime('%H:%M:%S')}")
-        
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Market Structure", s_trend)
-        m2.metric("Relative Volume", f"{round(row['rel_vol'], 2)}x")
-        m3.metric("Money Flow Index", round(row['mfi'], 1))
-        m4.metric("POC Level", round(v_profile['POC'], 2))
+        sig, sig_col, reasons = calculate_signal(row, trend)
 
-        # Charts
+        # ---------------------------
+        # RESULT DASHBOARD (Section 24)
+        # ---------------------------
+        st.markdown(f"### 🎯 Live Analysis: {sym_name} ({tf})")
+        
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("SIGNAL", sig, delta=trend, delta_color="normal")
+            st.markdown(f"<div style='height:10px; background-color:{sig_col}; border-radius:5px;'></div>", unsafe_allow_html=True)
+        c2.metric("PRICE", round(row['close'], 2), f"{round(row['close'] - df['close'].iloc[-2], 2)}")
+        c3.metric("RSI (Momentum)", round(row['rsi'], 1))
+        c4.metric("ADX (Strength)", round(row['adx'], 1))
+
+        # Chart
         fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'])])
-        fig.add_trace(go.Scatter(x=df.index, y=df['ema200'], name="EMA 200", line=dict(color='yellow')))
-        fig.update_layout(height=600, template="plotly_dark")
+        fig.add_trace(go.Scatter(x=df.index, y=df['ema200'], name="Trend EMA 200", line=dict(color='yellow')))
+        fig.update_layout(height=500, template="plotly_dark", margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
-        # Tabs
-        t1, t2, t3, t4, t5 = st.tabs(["Section 1: Structure", "Section 2: Levels", "Section 3: Volume Analysis", "Volume Profile Nodes", "CVD & OBV"])
+        # Tabs for Roadmap Details
+        t1, t2, t3, t4 = st.tabs(["Structure & Signal", "S/R Levels", "Volume Analysis", "Raw Data"])
         
         with t1:
-            st.write("**Recent BOS/CHOCH Logs**")
-            st.dataframe(df[df['break'] != ""].tail(10))
+            st.write("**Signal Confirmation Factors:**")
+            for r in reasons: st.write(f"✅ {r}")
+            st.write("**Recent BOS/CHOCH:**")
+            st.dataframe(df[df['break'] != ""].tail(5))
+        
         with t2:
-            st.write("**Static & Advanced Levels**")
-            st.json(static)
-            st.write(advanced)
+            st.write("**Pivot & Fibonacci Levels:**")
+            st.json(levels)
+            
         with t3:
-            st.write("**Volume Indicators**")
-            st.write({
-                "Chaikin Money Flow": row['cmf'],
-                "Acc/Dist Index": row['acc_dist'],
-                "Avg 20 Vol": row['avg_vol'],
-                "Volume Spike Detected": row['vol_spike']
-            })
+            if row['volume'] == 0:
+                st.warning("Volume is 0. Note: Zerodha does not provide volume for Spot Indices (Nifty/BankNifty). Use Futures for volume data.")
+            st.write(f"**OBV:** {row['obv']} | **MFI:** {row['mfi']}")
+            st.line_chart(df['obv'])
+            
         with t4:
-            st.write(f"POC: {v_profile['POC']}")
-            st.write("HVNs:", v_profile['HVNs'])
-        with t5:
-            st.line_chart(df['cvd'], use_container_width=True, height=200)
-            st.caption("Cumulative Volume Delta (CVD)")
-            st.line_chart(df['obv'], use_container_width=True, height=200)
-            st.caption("On-Balance Volume (OBV)")
+            st.dataframe(df.tail(20))
 
-run_analysis()
-
-# Handle live refresh
-if live_refresh:
-    time.sleep(60)
-    st.rerun()
+if __name__ == "__main__":
+    main()
+    if live_on:
+        time.sleep(refresh_rate)
+        st.rerun()

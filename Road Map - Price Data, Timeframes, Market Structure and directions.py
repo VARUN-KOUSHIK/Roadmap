@@ -19,7 +19,7 @@ class Section1_Data_Structure:
             "15 Minute": "15minute", "30 Minute": "30minute", "1 Hour": "60minute",
             "4 Hour": "60minute", "Daily": "day", "Weekly": "day"
         }
-        # Adhering to your provided Kite plan limits
+        # Kite basic plan limits
         self.limits = {
             "1 Minute": 30, "3 Minute": 60, "5 Minute": 60, "15 Minute": 90,
             "30 Minute": 180, "1 Hour": 180, "4 Hour": 180, "Daily": 365, "Weekly": 365
@@ -32,7 +32,6 @@ class Section1_Data_Structure:
             df = pd.DataFrame(records)
             df['date'] = pd.to_datetime(df['date'])
             df.set_index('date', inplace=True)
-            # Resampling for 4H and Weekly
             if tf == "4 Hour": df = df.resample('4H').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
             if tf == "Weekly": df = df.resample('W-MON').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
             return df
@@ -67,12 +66,9 @@ class Section1_Data_Structure:
 # ==========================================
 class Section2_S_R:
     def calculate(self, df):
-        # Static & Advanced (Pivots, Fib, CPR)
         lh, ll, lc = df['high'].iloc[-1], df['low'].iloc[-1], df['close'].iloc[-1]
         pp = (lh + ll + lc) / 3
-        bc = (lh + ll) / 2
-        tc = (pp - bc) + pp
-        # Fibonacci
+        bc, tc = (lh + ll) / 2, (pp - (lh + ll) / 2) + pp
         mx, mn = df['high'].max(), df['low'].min()
         fib618 = mx - ((mx - mn) * 0.618)
         return {"Pivot": pp, "CPR_Top": tc, "CPR_Bot": bc, "Fib618": fib618}
@@ -107,7 +103,6 @@ class Section5_Volatility:
         df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close']).average_true_range()
         bb = ta.volatility.BollingerBands(df['close'])
         df['bb_h'], df['bb_l'] = bb.bollinger_hband(), bb.bollinger_lband()
-        # Choppiness Index
         n = 14
         tr_sum = df['atr'].rolling(n).sum()
         p_range = df['high'].rolling(n).max() - df['low'].rolling(n).min()
@@ -115,11 +110,16 @@ class Section5_Volatility:
         return df
 
 # ==========================================
-# 6. TREND INDICATORS
+# 6. TREND INDICATORS (Fixed HMA Error)
 # ==========================================
 class Section6_Trend:
+    def _wma(self, series, period):
+        """Helper for WMA calculation since ta library lacks it"""
+        weights = np.arange(1, period + 1)
+        return series.rolling(period).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
+
     def calculate(self, df):
-        # EMAs (9, 22, 52, 100, 200)
+        # EMAs
         for p in [9, 22, 52, 100, 200]:
             df[f'ema{p}'] = ta.trend.EMAIndicator(df['close'], window=p).ema_indicator()
         # SMA & VWMA
@@ -129,22 +129,21 @@ class Section6_Trend:
         atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], 10).average_true_range()
         df['st_upper'] = ((df['high']+df['low'])/2) + (3 * atr)
         df['st_bull'] = df['close'] > df['st_upper'].shift(1)
-        # ADX & DMI
-        adx_obj = ta.trend.ADXIndicator(df['high'], df['low'], df['close'])
-        df['adx'] = adx_obj.adx()
-        df['dmi_p'] = adx_obj.adx_pos()
-        df['dmi_m'] = adx_obj.adx_neg()
         # Ichimoku & PSAR
         ichi = ta.trend.IchimokuIndicator(df['high'], df['low'])
         df['ichi_base'] = ichi.ichimoku_base_line()
         df['psar'] = ta.trend.PSARIndicator(df['high'], df['low'], df['close']).psar()
-        # HMA (Hull Moving Average)
-        def hma(series, period):
-            wma1 = ta.trend.WMAIndicator(series, window=period//2).wma_indicator()
-            wma2 = ta.trend.WMAIndicator(series, window=period).wma_indicator()
-            diff = 2 * wma1 - wma2
-            return ta.trend.WMAIndicator(diff, window=int(np.sqrt(period))).wma_indicator()
-        df['hma20'] = hma(df['close'], 20)
+        # ADX & DMI
+        adx_obj = ta.trend.ADXIndicator(df['high'], df['low'], df['close'])
+        df['adx'], df['dmi_p'], df['dmi_m'] = adx_obj.adx(), adx_obj.adx_pos(), adx_obj.adx_neg()
+        
+        # Hull Moving Average (HMA) - Manually calculating to avoid ta library errors
+        period = 20
+        half_p = period // 2
+        sqrt_p = int(np.sqrt(period))
+        wma_half = self._wma(df['close'], half_p)
+        wma_full = self._wma(df['close'], period)
+        df['hma20'] = self._wma(2 * wma_half - wma_full, sqrt_p)
         return df
 
 # ==========================================
@@ -158,57 +157,44 @@ live_refresh = st.sidebar.toggle("Live Refresh Mode")
 
 symbols = {"NIFTY 50": 256265, "BANK NIFTY": 260105, "RELIANCE": 738561, "TCS": 295321}
 sym_name = st.sidebar.selectbox("Symbol", list(symbols.keys()))
-tf = st.sidebar.selectbox("Timeframe", ["1 Minute", "5 Minute", "15 Minute", "1 Hour", "Daily"])
+tf = st.sidebar.selectbox("Timeframe", ["1 Minute", "5 Minute", "15 Minute", "1 Hour"])
 
 if st.sidebar.button("Execute Unified Analysis") or live_refresh:
     s1 = Section1_Data_Structure(api_key, token)
     df = s1.fetch_data(symbols[sym_name], tf)
-    
     if df is not None:
-        # EXECUTE IN ROADMAP ORDER
-        df, m_trend = s1.calculate_structure(df) # Sec 1
-        levels = Section2_S_R().calculate(df)    # Sec 2
-        df = Section3_Volume().calculate(df)     # Sec 3
-        df = Section4_Momentum().calculate(df)   # Sec 4
-        df = Section5_Volatility().calculate(df) # Sec 5
-        df = Section6_Trend().calculate(df)      # Sec 6
-        
+        df, m_trend = s1.calculate_structure(df)
+        levels = Section2_S_R().calculate(df)
+        df = Section3_Volume().calculate(df)
+        df = Section4_Momentum().calculate(df)
+        df = Section5_Volatility().calculate(df)
+        df = Section6_Trend().calculate(df)
         row = df.iloc[-1]
 
-        # --- DASHBOARD METRICS ---
         st.markdown(f"### 🛡️ Unified Roadmap Dashboard: {sym_name}")
-        
-        col_main, col_signal = st.columns([2, 1])
-        
-        with col_main:
+        c_main, c_sig = st.columns([2, 1])
+        with c_main:
             fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'])])
-            fig.add_trace(go.Scatter(x=df.index, y=df['ema200'], name="EMA 200", line=dict(color='yellow', width=1)))
-            fig.add_trace(go.Scatter(x=df.index, y=df['psar'], mode='markers', name="PSAR", marker=dict(size=4, color='white')))
             fig.update_layout(height=450, template="plotly_dark", margin=dict(l=0, r=0, t=0, b=0))
             st.plotly_chart(fig, use_container_width=True)
-
-        with col_signal:
-            st.markdown("##### 🚦 Trend Signal Table (Section 6)")
-            sig_data = [
+        with c_sig:
+            st.markdown("##### 🚦 Trend Signals (Section 6)")
+            sig_df = pd.DataFrame([
                 ["EMA 9 vs 22", "BUY" if row['ema9'] > row['ema22'] else "SELL"],
                 ["EMA 200 Bias", "BUY" if row['close'] > row['ema200'] else "SELL"],
                 ["Super Trend", "BUY" if row['st_bull'] else "SELL"],
                 ["DMI Cross", "BUY" if row['dmi_p'] > row['dmi_m'] else "SELL"],
-                ["Price vs VWMA", "BUY" if row['close'] > row['vwma20'] else "SELL"],
                 ["PSAR", "BUY" if row['close'] > row['psar'] else "SELL"]
-            ]
-            sig_df = pd.DataFrame(sig_data, columns=["Indicator", "Verdict"])
-            def style_v(v): return 'color: green' if v == 'BUY' else 'color: red'
-            st.table(sig_df.style.applymap(style_v, subset=['Verdict']))
+            ], columns=["Indicator", "Verdict"])
+            st.table(sig_df.style.applymap(lambda x: 'color: green' if x=='BUY' else 'color: red', subset=['Verdict']))
 
-        # SECTION TABS
-        tabs = st.tabs(["Structure", "S/R", "Volume", "Momentum", "Volatility", "Trend Indicators"])
-        with tabs[0]: st.write(f"Trend: {m_trend}"); st.dataframe(df[df['break'] != ""].tail(5))
+        tabs = st.tabs(["Structure", "S/R", "Volume", "Momentum", "Volatility", "Trend Details"])
+        with tabs[0]: st.write(f"Trend: {m_trend}"); st.write(df[df['break'] != ""].tail(5))
         with tabs[1]: st.json(levels)
-        with tabs[2]: st.write(f"MFI: {round(row['mfi'],1)} | OBV: {row['obv']} | CMF: {round(row['cmf'],2)}")
-        with tabs[3]: st.write(f"RSI: {round(row['rsi'],1)} | StochRSI: {round(row['stoch_rsi'],2)}")
+        with tabs[2]: st.write(f"OBV: {row['obv']} | MFI: {round(row['mfi'],1)}")
+        with tabs[3]: st.write(f"RSI: {round(row['rsi'],1)} | MACD: {round(row['macd'],2)}")
         with tabs[4]: st.write(f"ATR: {round(row['atr'],2)} | Choppiness: {round(row['choppiness'],1)}")
-        with tabs[5]: st.write(f"ADX: {round(row['adx'],1)} | DMI+: {round(row['dmi_p'],1)} | HMA 20: {round(row['hma20'],2)}")
+        with tabs[5]: st.write(f"ADX: {round(row['adx'],1)} | HMA 20: {round(row['hma20'],2)}")
 
     if live_refresh:
         time.sleep(10)

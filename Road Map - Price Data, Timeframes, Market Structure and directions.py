@@ -27,7 +27,7 @@ class PriceDataEngine:
         self.tf_map = {
             "1 Minute": "minute", "3 Minute": "3minute", "5 Minute": "5minute",
             "15 Minute": "15minute", "30 Minute": "30minute", "1 Hour": "60minute",
-            "4 Hour": "60minute", "Daily": "day", "Weekly": "day"
+            "Daily": "day"
         }
 
     def test_connection(self):
@@ -98,109 +98,125 @@ class SupportResistanceEngine:
 # ==========================================
 class AnalysisEngine:
     def process(self, df):
-        # Trend & Momentum (Section 4)
+        # Trend (Section 6)
         df['ema200'] = ta.trend.EMAIndicator(df['close'], 200).ema_indicator()
+        # Momentum (Section 4)
         df['rsi'] = ta.momentum.RSIIndicator(df['close']).rsi()
         df['adx'] = ta.trend.ADXIndicator(df['high'], df['low'], df['close']).adx()
-        df['vwap'] = ta.volume.VolumeWeightedAveragePrice(df['high'], df['low'], df['close'], df['volume']).volume_weighted_average_price()
-        
         # Volume (Section 3)
-        df['avg_vol'] = df['volume'].rolling(20).mean()
         df['obv'] = ta.volume.OnBalanceVolumeIndicator(df['close'], df['volume']).on_balance_volume()
         df['mfi'] = ta.volume.MFIIndicator(df['high'], df['low'], df['close'], df['volume']).money_flow_index()
         return df
 
 # ==========================================
-# 5. SIGNAL SCORING (Result Oriented) - Section 21
+# 5. VOLATILITY INDICATORS - Roadmap Section 5
+# ==========================================
+class VolatilityEngine:
+    def calculate_volatility(self, df):
+        df = df.copy()
+        # ATR
+        df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close']).average_true_range()
+        # Bollinger Bands
+        bb = ta.volatility.BollingerBands(df['close'])
+        df['bb_high'], df['bb_low'], df['bb_mid'] = bb.bollinger_hband(), bb.bollinger_lband(), bb.bollinger_mavg()
+        # Keltner Channels
+        kc = ta.volatility.KeltnerChannel(df['high'], df['low'], df['close'])
+        df['kc_high'], df['kc_low'] = kc.keltner_channel_hband(), kc.keltner_channel_lband()
+        # Donchian Channel
+        dc = ta.volatility.DonchianChannel(df['high'], df['low'], df['close'])
+        df['dc_high'], df['dc_low'] = dc.donchian_channel_hband(), dc.donchian_channel_lband()
+        # Standard Deviation
+        df['std_dev'] = df['close'].rolling(window=20).std()
+        # Historical Volatility (252 day annualization proxy)
+        df['hist_vol'] = df['close'].pct_change().rolling(window=20).std() * np.sqrt(252) * 100
+        # Choppiness Index (Formula: 100 * LOG10( SUM(ATR,n) / (MaxHigh(n) - MinLow(n)) ) / LOG10(n))
+        n = 14
+        tr_sum = df['atr'].rolling(n).sum()
+        price_range = df['high'].rolling(n).max() - df['low'].rolling(n).min()
+        df['choppiness'] = 100 * np.log10(tr_sum / price_range) / np.log10(n)
+        return df
+
+# ==========================================
+# 21. SIGNAL SCORING - Roadmap Section 21
 # ==========================================
 def calculate_signal(row, trend):
     score = 0
-    reasons = []
+    if row['close'] > row['ema200']: score += 25
+    if 40 < row['rsi'] < 65: score += 15
+    if trend == "Bullish": score += 30
+    if row['adx'] > 25: score += 20
+    # Volatility Check (Deduct if too choppy)
+    if 'choppiness' in row and row['choppiness'] > 61.8: score -= 10 
     
-    if row['close'] > row['ema200']: score += 25; reasons.append("Above EMA 200")
-    if 40 < row['rsi'] < 65: score += 15; reasons.append("RSI Neutral-Bullish")
-    if trend == "Bullish": score += 30; reasons.append("Market Structure Bullish")
-    if row['adx'] > 25: score += 20; reasons.append("Strong Trend Strength")
-    
-    if score >= 70: return "STRONG BUY", "green", reasons
-    if score >= 40: return "BUY / HOLD", "orange", reasons
-    return "BEARISH / AVOID", "red", reasons
+    if score >= 70: return "STRONG BUY", "green"
+    if score >= 40: return "BUY / HOLD", "orange"
+    return "BEARISH / AVOID", "red"
 
 # ==========================================
 # MAIN DASHBOARD
 # ==========================================
-st.set_page_config(layout="wide", page_title="Result Dashboard")
-st.sidebar.header("🔑 Kite API & Live")
+st.set_page_config(layout="wide", page_title="Master Roadmap Dashboard")
+st.sidebar.header("🔑 Kite API & Refresh")
 api_key = st.sidebar.text_input("API Key", type="password")
 token = st.sidebar.text_input("Access Token", type="password")
-refresh_rate = st.sidebar.slider("Refresh Interval (Seconds)", 5, 60, 10)
-live_on = st.sidebar.toggle("Live Refresh Mode")
+refresh_rate = st.sidebar.slider("Refresh Interval", 5, 60, 10)
+live_on = st.sidebar.toggle("Live Refresh")
 
-symbols = {
-    "NIFTY 50": 256265, "BANK NIFTY": 260105, "FIN NIFTY": 257801, 
-    "RELIANCE": 738561, "HDFC BANK": 341249, "TCS": 295321
-}
+symbols = {"NIFTY 50": 256265, "BANK NIFTY": 260105, "RELIANCE": 738561, "TCS": 295321}
 sym_name = st.sidebar.selectbox("Symbol", list(symbols.keys()))
 tf = st.sidebar.selectbox("Timeframe", ["1 Minute", "5 Minute", "15 Minute", "1 Hour"])
 
 def main():
     if not api_key or not token:
-        st.info("Please enter API Key and Access Token in the sidebar to start live data.")
+        st.info("Please enter credentials in the sidebar.")
         return
 
     engine = PriceDataEngine(api_key, token)
     df = engine.fetch_ohlcv(symbols[sym_name], tf)
     
     if df is not None:
-        # Process Modules in Roadmap Order
+        # PROCESS IN ROADMAP ORDER
+        # 1 & 2
         df, trend = MarketStructureEngine().calculate_structure(df)
+        # 3 & 4
         df = AnalysisEngine().process(df)
+        # 5 (NEW)
+        df = VolatilityEngine().calculate_volatility(df)
         levels = SupportResistanceEngine().calculate_levels(df)
         
-        # Latest Data for Dashboard
         row = df.iloc[-1]
-        sig, sig_col, reasons = calculate_signal(row, trend)
+        sig, sig_col = calculate_signal(row, trend)
 
-        # ---------------------------
-        # RESULT DASHBOARD (Section 24)
-        # ---------------------------
-        st.markdown(f"### 🎯 Live Analysis: {sym_name} ({tf})")
-        
+        # DASHBOARD (Section 24)
+        st.markdown(f"### 🎯 Live Dashboard: {sym_name}")
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            st.metric("SIGNAL", sig, delta=trend, delta_color="normal")
-            st.markdown(f"<div style='height:10px; background-color:{sig_col}; border-radius:5px;'></div>", unsafe_allow_html=True)
-        c2.metric("PRICE", round(row['close'], 2), f"{round(row['close'] - df['close'].iloc[-2], 2)}")
-        c3.metric("RSI (Momentum)", round(row['rsi'], 1))
-        c4.metric("ADX (Strength)", round(row['adx'], 1))
+            st.metric("SIGNAL", sig)
+            st.markdown(f"<div style='height:8px; background-color:{sig_col};'></div>", unsafe_allow_html=True)
+        c2.metric("PRICE", round(row['close'], 2))
+        c3.metric("ATR (Volatility)", round(row['atr'], 2))
+        c4.metric("CHOPPINESS", round(row['choppiness'], 1))
 
-        # Chart
+        # Chart with Bollinger Bands
         fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'])])
-        fig.add_trace(go.Scatter(x=df.index, y=df['ema200'], name="Trend EMA 200", line=dict(color='yellow')))
-        fig.update_layout(height=500, template="plotly_dark", margin=dict(l=10, r=10, t=10, b=10))
+        fig.add_trace(go.Scatter(x=df.index, y=df['bb_high'], name="BB Upper", line=dict(color='rgba(173, 216, 230, 0.4)')))
+        fig.add_trace(go.Scatter(x=df.index, y=df['bb_low'], name="BB Lower", line=dict(color='rgba(173, 216, 230, 0.4)'), fill='tonexty'))
+        fig.update_layout(height=500, template="plotly_dark")
         st.plotly_chart(fig, use_container_width=True)
 
-        # Tabs for Roadmap Details
-        t1, t2, t3, t4 = st.tabs(["Structure & Signal", "S/R Levels", "Volume Analysis", "Raw Data"])
+        # TABS
+        t1, t2, t3, t4, t5 = st.tabs(["Structure", "S/R Levels", "Volume & Momentum", "Volatility (Sec 5)", "Raw Data"])
         
-        with t1:
-            st.write("**Signal Confirmation Factors:**")
-            for r in reasons: st.write(f"✅ {r}")
-            st.write("**Recent BOS/CHOCH:**")
-            st.dataframe(df[df['break'] != ""].tail(5))
-        
-        with t2:
-            st.write("**Pivot & Fibonacci Levels:**")
-            st.json(levels)
-            
-        with t3:
-            if row['volume'] == 0:
-                st.warning("Volume is 0. Note: Zerodha does not provide volume for Spot Indices (Nifty/BankNifty). Use Futures for volume data.")
-            st.write(f"**OBV:** {row['obv']} | **MFI:** {row['mfi']}")
-            st.line_chart(df['obv'])
-            
+        with t1: st.dataframe(df[df['break'] != ""].tail(5))
+        with t2: st.json(levels)
+        with t3: st.write(f"RSI: {round(row['rsi'],1)} | MFI: {round(row['mfi'],1)} | ADX: {round(row['adx'],1)}")
         with t4:
-            st.dataframe(df.tail(20))
+            st.write("**Volatility Analysis Details**")
+            st.write(f"Standard Deviation: {round(row['std_dev'], 2)}")
+            st.write(f"Historical Volatility: {round(row['hist_vol'], 2)}%")
+            st.write(f"Donchian High: {row['dc_high']} | Donchian Low: {row['dc_low']}")
+            st.progress(min(max(int(row['choppiness']), 0), 100), text=f"Choppiness Index: {round(row['choppiness'], 1)}")
+        with t5: st.dataframe(df.tail(10))
 
 if __name__ == "__main__":
     main()

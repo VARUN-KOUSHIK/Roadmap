@@ -19,7 +19,6 @@ class Section1_Data_Structure:
             "15 Minute": "15minute", "30 Minute": "30minute", "1 Hour": "60minute",
             "4 Hour": "60minute", "Daily": "day", "Weekly": "day"
         }
-        # Adhering to your provided Kite plan limits
         self.limits = {
             "1 Minute": 30, "3 Minute": 60, "5 Minute": 60, "15 Minute": 90,
             "30 Minute": 180, "1 Hour": 180, "4 Hour": 180, "Daily": 365, "Weekly": 365
@@ -32,7 +31,6 @@ class Section1_Data_Structure:
             df = pd.DataFrame(records)
             df['date'] = pd.to_datetime(df['date'])
             df.set_index('date', inplace=True)
-            # Resampling for 4H and Weekly
             if tf == "4 Hour": df = df.resample('4H').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
             if tf == "Weekly": df = df.resample('W-MON').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
             return df
@@ -69,8 +67,7 @@ class Section2_S_R:
     def calculate(self, df):
         lh, ll, lc = df['high'].iloc[-1], df['low'].iloc[-1], df['close'].iloc[-1]
         pp = (lh + ll + lc) / 3
-        bc = (lh + ll) / 2
-        tc = (pp - bc) + pp
+        bc, tc = (lh + ll) / 2, (pp - (lh + ll) / 2) + pp
         mx, mn = df['high'].max(), df['low'].min()
         fib618 = mx - ((mx - mn) * 0.618)
         return {"Pivot": pp, "CPR_Top": tc, "CPR_Bot": bc, "Fib618": fib618}
@@ -116,40 +113,71 @@ class Section5_Volatility:
 # ==========================================
 class Section6_Trend:
     def _wma(self, series, period):
-        """Custom Weighted Moving Average for HMA logic"""
         weights = np.arange(1, period + 1)
         return series.rolling(period).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
 
     def calculate(self, df):
-        # EMAs (9, 22, 52, 100, 200)
         for p in [9, 22, 52, 100, 200]:
             df[f'ema{p}'] = ta.trend.EMAIndicator(df['close'], window=p).ema_indicator()
-        
-        # SMA & VWMA
         df['sma50'] = ta.trend.SMAIndicator(df['close'], window=50).sma_indicator()
         df['vwma20'] = (df['close'] * df['volume']).rolling(20).sum() / df['volume'].rolling(20).sum()
-        
-        # Super Trend
         atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], 10).average_true_range()
         df['st_upper'] = ((df['high']+df['low'])/2) + (3 * atr)
         df['st_bull'] = df['close'] > df['st_upper'].shift(1)
-        
-        # ADX & DMI
         adx_obj = ta.trend.ADXIndicator(df['high'], df['low'], df['close'])
         df['adx'], df['dmi_p'], df['dmi_m'] = adx_obj.adx(), adx_obj.adx_pos(), adx_obj.adx_neg()
-        
-        # Ichimoku & PSAR
         ichi = ta.trend.IchimokuIndicator(df['high'], df['low'])
         df['ichi_base'] = ichi.ichimoku_base_line()
         df['psar'] = ta.trend.PSARIndicator(df['high'], df['low'], df['close']).psar()
-        
-        # Hull Moving Average (HMA) Calculation
         period = 20
-        half_p = period // 2
-        sqrt_p = int(np.sqrt(period))
-        wma_half = self._wma(df['close'], half_p)
-        wma_full = self._wma(df['close'], period)
+        half_p, sqrt_p = period // 2, int(np.sqrt(period))
+        wma_half, wma_full = self._wma(df['close'], half_p), self._wma(df['close'], period)
         df['hma20'] = self._wma(2 * wma_half - wma_full, sqrt_p)
+        return df
+
+# ==========================================
+# 7. PRICE ACTION RECOGNITION
+# ==========================================
+class Section7_PriceAction:
+    def recognize(self, df):
+        df = df.copy()
+        # Basic dimensions
+        df['body'] = df['close'] - df['open']
+        df['abs_body'] = abs(df['body'])
+        df['range'] = df['high'] - df['low']
+        df['upper_wick'] = df['high'] - df[['open', 'close']].max(axis=1)
+        df['lower_wick'] = df[['open', 'close']].min(axis=1) - df['low']
+        
+        # Recognize Patterns
+        # 1. Inside Bar / Outside Bar
+        df['Inside Bar'] = (df['high'] < df['high'].shift(1)) & (df['low'] > df['low'].shift(1))
+        df['Outside Bar'] = (df['high'] > df['high'].shift(1)) & (df['low'] < df['low'].shift(1))
+        
+        # 2. Pin Bar (Wick at least 2x body)
+        df['Pin Bar'] = (df['lower_wick'] > df['abs_body'] * 2) | (df['upper_wick'] > df['abs_body'] * 2)
+        
+        # 3. Engulfing
+        df['Bullish Engulfing'] = (df['close'] > df['open'].shift(1)) & (df['open'] < df['close'].shift(1)) & (df['body'].shift(1) < 0)
+        df['Bearish Engulfing'] = (df['close'] < df['open'].shift(1)) & (df['open'] > df['close'].shift(1)) & (df['body'].shift(1) > 0)
+        
+        # 4. Doji (Body < 10% of range)
+        df['Doji'] = df['abs_body'] <= (df['range'] * 0.1)
+        
+        # 5. Hammer & Shooting Star
+        df['Hammer'] = (df['lower_wick'] > (df['abs_body'] * 2)) & (df['upper_wick'] < (df['abs_body'] * 0.5))
+        df['Shooting Star'] = (df['upper_wick'] > (df['abs_body'] * 2)) & (df['lower_wick'] < (df['abs_body'] * 0.5))
+        
+        # 6. Marubozu (Little to no wicks)
+        df['Marubozu'] = (df['abs_body'] > (df['range'] * 0.9))
+        
+        # 7. Morning Star / Evening Star (3-candle patterns)
+        df['Morning Star'] = (df['body'].shift(2) < 0) & (df['abs_body'].shift(1) < df['abs_body'].shift(2) * 0.3) & (df['body'] > 0)
+        df['Evening Star'] = (df['body'].shift(2) > 0) & (df['abs_body'].shift(1) < df['abs_body'].shift(2) * 0.3) & (df['body'] < 0)
+        
+        # 8. Three White Soldiers / Black Crows
+        df['Three White Soldiers'] = (df['body'] > 0) & (df['body'].shift(1) > 0) & (df['body'].shift(2) > 0) & (df['close'] > df['close'].shift(1)) & (df['close'].shift(1) > df['close'].shift(2))
+        df['Three Black Crows'] = (df['body'] < 0) & (df['body'].shift(1) < 0) & (df['body'].shift(2) < 0) & (df['close'] < df['close'].shift(1)) & (df['close'].shift(1) < df['close'].shift(2))
+        
         return df
 
 # ==========================================
@@ -168,51 +196,48 @@ tf = st.sidebar.selectbox("Timeframe", ["1 Minute", "5 Minute", "15 Minute", "1 
 if st.sidebar.button("Execute Unified Analysis") or live_refresh:
     s1 = Section1_Data_Structure(api_key, token)
     df = s1.fetch_data(symbols[sym_name], tf)
-    
     if df is not None:
         # EXECUTE IN ROADMAP ORDER
-        df, m_trend = s1.calculate_structure(df)    # Sec 1
-        levels = Section2_S_R().calculate(df)       # Sec 2
-        df = Section3_Volume().calculate(df)        # Sec 3
-        df = Section4_Momentum().calculate(df)      # Sec 4
-        df = Section5_Volatility().calculate(df)    # Sec 5
-        df = Section6_Trend().calculate(df)         # Sec 6
+        df, m_trend = s1.calculate_structure(df)    # 1
+        levels = Section2_S_R().calculate(df)       # 2
+        df = Section3_Volume().calculate(df)        # 3
+        df = Section4_Momentum().calculate(df)      # 4
+        df = Section5_Volatility().calculate(df)    # 5
+        df = Section6_Trend().calculate(df)         # 6
+        df = Section7_PriceAction().recognize(df)   # 7 (NEW)
         
         row = df.iloc[-1]
-
-        # --- DASHBOARD METRICS ---
         st.markdown(f"### 🛡️ Unified Roadmap Dashboard: {sym_name}")
-        
-        col_main, col_signal = st.columns([2, 1])
-        
-        with col_main:
+        c_main, c_sig = st.columns([2, 1])
+        with c_main:
             fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'])])
-            fig.add_trace(go.Scatter(x=df.index, y=df['ema200'], name="EMA 200", line=dict(color='yellow', width=1)))
             fig.update_layout(height=450, template="plotly_dark", margin=dict(l=0, r=0, t=0, b=0))
             st.plotly_chart(fig, use_container_width=True)
-
-        with col_signal:
+        with c_sig:
             st.markdown("##### 🚦 Trend Signal Table (Section 6)")
-            sig_data = [
+            sig_df = pd.DataFrame([
                 ["EMA 9 vs 22", "BUY" if row['ema9'] > row['ema22'] else "SELL"],
                 ["EMA 200 Bias", "BUY" if row['close'] > row['ema200'] else "SELL"],
                 ["Super Trend", "BUY" if row['st_bull'] else "SELL"],
                 ["DMI Cross", "BUY" if row['dmi_p'] > row['dmi_m'] else "SELL"],
-                ["Price vs VWMA", "BUY" if row['close'] > row['vwma20'] else "SELL"],
                 ["PSAR Signal", "BUY" if row['close'] > row['psar'] else "SELL"]
-            ]
-            sig_df = pd.DataFrame(sig_data, columns=["Indicator", "Verdict"])
-            
-            # FIX: Using .map() instead of .applymap() for Pandas 3.0+ compatibility
+            ], columns=["Indicator", "Verdict"])
             st.table(sig_df.style.map(lambda x: 'color: green' if x == 'BUY' else 'color: red', subset=['Verdict']))
 
-        # SECTION TABS
-        tabs = st.tabs(["Structure", "S/R Levels", "Volume & Momentum", "Volatility", "Trend Details"])
+        tabs = st.tabs(["Structure", "S/R Levels", "Price Action (Sec 7)", "Vol & Mom", "Trend Details"])
         with tabs[0]: st.write(f"Trend: {m_trend}"); st.dataframe(df[df['break'] != ""].tail(5))
         with tabs[1]: st.json(levels)
-        with tabs[2]: st.write(f"MFI: {round(row['mfi'],1)} | RSI: {round(row['rsi'],1)} | OBV: {row['obv']}")
-        with tabs[3]: st.write(f"ATR: {round(row['atr'],2)} | Choppiness: {round(row['choppiness'],1)}")
-        with tabs[4]: st.write(f"ADX: {round(row['adx'],1)} | HMA 20: {round(row['hma20'],2)} | DMI+: {round(row['dmi_p'],1)}")
+        with tabs[2]:
+            st.write("**Detected Price Action Patterns**")
+            patterns = ['Inside Bar', 'Outside Bar', 'Pin Bar', 'Bullish Engulfing', 'Bearish Engulfing', 'Doji', 'Hammer', 'Shooting Star', 'Marubozu', 'Morning Star', 'Evening Star', 'Three White Soldiers', 'Three Black Crows']
+            active_patterns = [p for p in patterns if row[p]]
+            if active_patterns:
+                for ap in active_patterns: st.success(f"Pattern Detected: {ap}")
+            else: st.info("No major patterns on latest candle")
+            st.write("**Pattern History Log**")
+            st.dataframe(df[df[patterns].any(axis=1)][patterns].tail(10))
+        with tabs[3]: st.write(f"RSI: {round(row['rsi'],1)} | MFI: {round(row['mfi'],1)} | ATR: {round(row['atr'],2)}")
+        with tabs[4]: st.write(f"ADX: {round(row['adx'],1)} | HMA 20: {round(row['hma20'],2)}")
 
     if live_refresh:
         time.sleep(10)

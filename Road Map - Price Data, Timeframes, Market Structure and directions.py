@@ -38,6 +38,7 @@ class PriceDataEngine:
             return False, f"Connection Failed: {str(e)}"
 
     def fetch_ohlcv(self, symbol_token, timeframe):
+        # Using the Kite Basic Plan limits provided previously
         limits = {"1 Minute": 30, "3 Minute": 60, "5 Minute": 60, "15 Minute": 90, "1 Hour": 180, "Daily": 365}
         days_back = limits.get(timeframe, 30)
         try:
@@ -96,13 +97,10 @@ class SupportResistanceEngine:
 # ==========================================
 # 4. VOLUME & MOMENTUM - Roadmap Section 3 & 4
 # ==========================================
-class AnalysisEngine:
+class MomentumVolumeEngine:
     def process(self, df):
-        # Trend (Section 6)
-        df['ema200'] = ta.trend.EMAIndicator(df['close'], 200).ema_indicator()
         # Momentum (Section 4)
         df['rsi'] = ta.momentum.RSIIndicator(df['close']).rsi()
-        df['adx'] = ta.trend.ADXIndicator(df['high'], df['low'], df['close']).adx()
         # Volume (Section 3)
         df['obv'] = ta.volume.OnBalanceVolumeIndicator(df['close'], df['volume']).on_balance_volume()
         df['mfi'] = ta.volume.MFIIndicator(df['high'], df['low'], df['close'], df['volume']).money_flow_index()
@@ -112,24 +110,12 @@ class AnalysisEngine:
 # 5. VOLATILITY INDICATORS - Roadmap Section 5
 # ==========================================
 class VolatilityEngine:
-    def calculate_volatility(self, df):
+    def calculate(self, df):
         df = df.copy()
-        # ATR
         df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close']).average_true_range()
-        # Bollinger Bands
         bb = ta.volatility.BollingerBands(df['close'])
-        df['bb_high'], df['bb_low'], df['bb_mid'] = bb.bollinger_hband(), bb.bollinger_lband(), bb.bollinger_mavg()
-        # Keltner Channels
-        kc = ta.volatility.KeltnerChannel(df['high'], df['low'], df['close'])
-        df['kc_high'], df['kc_low'] = kc.keltner_channel_hband(), kc.keltner_channel_lband()
-        # Donchian Channel
-        dc = ta.volatility.DonchianChannel(df['high'], df['low'], df['close'])
-        df['dc_high'], df['dc_low'] = dc.donchian_channel_hband(), dc.donchian_channel_lband()
-        # Standard Deviation
-        df['std_dev'] = df['close'].rolling(window=20).std()
-        # Historical Volatility (252 day annualization proxy)
-        df['hist_vol'] = df['close'].pct_change().rolling(window=20).std() * np.sqrt(252) * 100
-        # Choppiness Index (Formula: 100 * LOG10( SUM(ATR,n) / (MaxHigh(n) - MinLow(n)) ) / LOG10(n))
+        df['bb_high'], df['bb_low'] = bb.bollinger_hband(), bb.bollinger_lband()
+        # Choppiness Index
         n = 14
         tr_sum = df['atr'].rolling(n).sum()
         price_range = df['high'].rolling(n).max() - df['low'].rolling(n).min()
@@ -137,7 +123,48 @@ class VolatilityEngine:
         return df
 
 # ==========================================
-# 21. SIGNAL SCORING - Roadmap Section 21
+# 6. TREND INDICATORS - Roadmap Section 6
+# ==========================================
+class TrendIndicatorEngine:
+    def calculate(self, df):
+        df = df.copy()
+        # EMAs (9, 22, 52, 100, 200)
+        for p in [9, 22, 52, 100, 200]:
+            df[f'ema{p}'] = ta.trend.EMAIndicator(df['close'], window=p).ema_indicator()
+        
+        # SMA
+        df['sma50'] = ta.trend.SMAIndicator(df['close'], window=50).sma_indicator()
+        
+        # VWMA (Volume Weighted Moving Average)
+        def vwma(price, volume, window):
+            pv = price * volume
+            return pv.rolling(window).sum() / volume.rolling(window).sum()
+        df['vwma20'] = vwma(df['close'], df['volume'], 20)
+
+        # Super Trend (Logic from previous sections)
+        atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], 10).average_true_range()
+        df['st_upper'] = ((df['high']+df['low'])/2) + (3 * atr)
+        df['st_bull'] = df['close'] > df['st_upper'].shift(1)
+
+        # Ichimoku Cloud
+        ichi = ta.trend.IchimokuIndicator(df['high'], df['low'])
+        df['ichi_a'] = ichi.ichimoku_a()
+        df['ichi_b'] = ichi.ichimoku_b()
+        df['ichi_base'] = ichi.ichimoku_base_line()
+
+        # Parabolic SAR
+        df['psar'] = ta.trend.PSARIndicator(df['high'], df['low'], df['close']).psar()
+
+        # ADX & DMI
+        adx_obj = ta.trend.ADXIndicator(df['high'], df['low'], df['close'])
+        df['adx'] = adx_obj.adx()
+        df['dmi_plus'] = adx_obj.adx_pos()
+        df['dmi_minus'] = adx_obj.adx_neg()
+        
+        return df
+
+# ==========================================
+# 21. SIGNAL SCORING & DASHBOARD
 # ==========================================
 def calculate_signal(row, trend):
     score = 0
@@ -145,21 +172,19 @@ def calculate_signal(row, trend):
     if 40 < row['rsi'] < 65: score += 15
     if trend == "Bullish": score += 30
     if row['adx'] > 25: score += 20
-    # Volatility Check (Deduct if too choppy)
-    if 'choppiness' in row and row['choppiness'] > 61.8: score -= 10 
+    if row['st_bull']: score += 10
     
-    if score >= 70: return "STRONG BUY", "green"
-    if score >= 40: return "BUY / HOLD", "orange"
+    if score >= 75: return "STRONG BUY", "green"
+    if score >= 50: return "BUY / HOLD", "orange"
     return "BEARISH / AVOID", "red"
 
 # ==========================================
-# MAIN DASHBOARD
+# MAIN UI EXECUTION
 # ==========================================
-st.set_page_config(layout="wide", page_title="Master Roadmap Dashboard")
-st.sidebar.header("🔑 Kite API & Refresh")
+st.set_page_config(layout="wide", page_title="Master Roadmap")
+st.sidebar.header("🔑 Kite Access")
 api_key = st.sidebar.text_input("API Key", type="password")
 token = st.sidebar.text_input("Access Token", type="password")
-refresh_rate = st.sidebar.slider("Refresh Interval", 5, 60, 10)
 live_on = st.sidebar.toggle("Live Refresh")
 
 symbols = {"NIFTY 50": 256265, "BANK NIFTY": 260105, "RELIANCE": 738561, "TCS": 295321}
@@ -168,58 +193,55 @@ tf = st.sidebar.selectbox("Timeframe", ["1 Minute", "5 Minute", "15 Minute", "1 
 
 def main():
     if not api_key or not token:
-        st.info("Please enter credentials in the sidebar.")
+        st.info("Enter credentials to start.")
         return
 
-    engine = PriceDataEngine(api_key, token)
-    df = engine.fetch_ohlcv(symbols[sym_name], tf)
+    data_eng = PriceDataEngine(api_key, token)
+    df = data_eng.fetch_ohlcv(symbols[sym_name], tf)
     
     if df is not None:
-        # PROCESS IN ROADMAP ORDER
-        # 1 & 2
+        # EXECUTE IN ORDER
         df, trend = MarketStructureEngine().calculate_structure(df)
-        # 3 & 4
-        df = AnalysisEngine().process(df)
-        # 5 (NEW)
-        df = VolatilityEngine().calculate_volatility(df)
+        df = MomentumVolumeEngine().process(df)
+        df = VolatilityEngine().calculate(df)
+        df = TrendIndicatorEngine().calculate(df)
         levels = SupportResistanceEngine().calculate_levels(df)
         
         row = df.iloc[-1]
         sig, sig_col = calculate_signal(row, trend)
 
-        # DASHBOARD (Section 24)
-        st.markdown(f"### 🎯 Live Dashboard: {sym_name}")
+        # UI DASHBOARD
+        st.markdown(f"### 🎯 Roadmap Dashboard: {sym_name} | Signal: {sig}")
         c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.metric("SIGNAL", sig)
-            st.markdown(f"<div style='height:8px; background-color:{sig_col};'></div>", unsafe_allow_html=True)
-        c2.metric("PRICE", round(row['close'], 2))
-        c3.metric("ATR (Volatility)", round(row['atr'], 2))
-        c4.metric("CHOPPINESS", round(row['choppiness'], 1))
+        c1.metric("Price", round(row['close'], 2))
+        c2.metric("ADX (Trend Strength)", round(row['adx'], 1))
+        c3.metric("RSI", round(row['rsi'], 1))
+        c4.metric("Market Structure", trend)
 
-        # Chart with Bollinger Bands
         fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'])])
-        fig.add_trace(go.Scatter(x=df.index, y=df['bb_high'], name="BB Upper", line=dict(color='rgba(173, 216, 230, 0.4)')))
-        fig.add_trace(go.Scatter(x=df.index, y=df['bb_low'], name="BB Lower", line=dict(color='rgba(173, 216, 230, 0.4)'), fill='tonexty'))
+        fig.add_trace(go.Scatter(x=df.index, y=df['ema200'], name="EMA 200", line=dict(color='yellow')))
+        fig.add_trace(go.Scatter(x=df.index, y=df['psar'], mode='markers', name="PSAR", marker=dict(size=3, color='white')))
         fig.update_layout(height=500, template="plotly_dark")
         st.plotly_chart(fig, use_container_width=True)
 
         # TABS
-        t1, t2, t3, t4, t5 = st.tabs(["Structure", "S/R Levels", "Volume & Momentum", "Volatility (Sec 5)", "Raw Data"])
+        t1, t2, t3, t4, t5 = st.tabs(["Structure", "S/R Levels", "Indicators (3-5)", "Trend Details (Sec 6)", "Raw Logs"])
         
-        with t1: st.dataframe(df[df['break'] != ""].tail(5))
+        with t1: st.write(df[df['break'] != ""].tail(5))
         with t2: st.json(levels)
-        with t3: st.write(f"RSI: {round(row['rsi'],1)} | MFI: {round(row['mfi'],1)} | ADX: {round(row['adx'],1)}")
+        with t3: 
+            st.write(f"Volatility (ATR): {round(row['atr'], 2)}")
+            st.write(f"Choppiness: {round(row['choppiness'], 1)}")
         with t4:
-            st.write("**Volatility Analysis Details**")
-            st.write(f"Standard Deviation: {round(row['std_dev'], 2)}")
-            st.write(f"Historical Volatility: {round(row['hist_vol'], 2)}%")
-            st.write(f"Donchian High: {row['dc_high']} | Donchian Low: {row['dc_low']}")
-            st.progress(min(max(int(row['choppiness']), 0), 100), text=f"Choppiness Index: {round(row['choppiness'], 1)}")
+            st.write("**Advanced Trend Indicators (Section 6)**")
+            st.write(f"DMI+: {round(row['dmi_plus'], 1)} | DMI-: {round(row['dmi_minus'], 1)}")
+            st.write(f"EMA Alignment: 9 > 22: {row['ema9'] > row['ema22']}")
+            st.write(f"SuperTrend Bullish: {row['st_bull']}")
+            st.write(f"VWMA (20): {round(row['vwma20'], 2)}")
         with t5: st.dataframe(df.tail(10))
 
 if __name__ == "__main__":
     main()
     if live_on:
-        time.sleep(refresh_rate)
+        time.sleep(10)
         st.rerun()
